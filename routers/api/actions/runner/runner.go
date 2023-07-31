@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	actions_model "code.gitea.io/gitea/models/actions"
 	"code.gitea.io/gitea/modules/actions"
@@ -121,6 +122,44 @@ func (s *Service) Declare(
 			Version: runner.Version,
 			Labels:  runner.AgentLabels,
 		},
+	}), nil
+}
+
+func (s *Service) TasksVersionBlockingQuery(
+	ctx context.Context,
+	req *connect.Request[runnerv1.TasksVersionBlockingQueryRequest],
+) (*connect.Response[runnerv1.TasksVersionBlockingQueryResponse], error) {
+	log.Warn("blocking queries wait time: %s", req.Msg.Wait.AsDuration().String())
+	ctx, cancel := context.WithTimeout(ctx, req.Msg.Wait.AsDuration())
+	defer cancel()
+
+	runner := GetRunner(ctx)
+	latestVersion, err := actions_model.GetTasksVersionByScope(ctx, runner.OwnerID, runner.RepoID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "query tasks version failed: %v", err)
+	} else if latestVersion == 0 {
+		if err := actions_model.IncreaseTaskVersion(ctx, runner.OwnerID, runner.RepoID); err != nil {
+			return nil, status.Errorf(codes.Internal, "fail to increase task version: %v", err)
+		}
+		// if we don't increase the value of `latestVersion` here,
+		// the response of FetchTask will return tasksVersion as zero.
+		// and the runner will treat it as an old version of Gitea.
+		latestVersion++
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, status.Error(codes.DeadlineExceeded, "timeout")
+		default:
+			log.Warn("mock fetch cache")
+			// TODO compare version
+			time.Sleep(time.Second)
+		}
+	}
+
+	return connect.NewResponse(&runnerv1.TasksVersionBlockingQueryResponse{
+		TasksVersion: latestVersion,
 	}), nil
 }
 
